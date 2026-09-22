@@ -21,6 +21,14 @@ match by their final reported pointer; deletions match by the original path.
 As with other conflicts, an explicit resolution overrides the protection;
 unresolved protected conflicts keep the base value.
 
+A protected *descendant* makes its whole structural unit atomic when that
+unit is added or deleted on only one side: the object (or identity-array
+item) is never assembled field by field. Without an adjudication the base
+block is kept wholesale when base carries the unit, and nothing is written
+when it does not; the hit protected descendants are still reported
+individually. An explicit resolution for one of them places the chosen
+side's whole unit (an absent side omits it).
+
 Object arrays listed in the identity mapping are merged per item keyed by an
 identity field. Arrays without an identity field are treated as atomic
 values (replaced wholesale, never diffed element by element).
@@ -314,10 +322,17 @@ class Merger:
                 left, right, base, path, conflicts, resolutions, protected
             )
         # One-sided add/delete of an object (or two-sided object addition):
-        # normally atomic, but descend when a protected path lives below.
+        # descend only when a protected path lives below. A one-sided
+        # add/delete containing a hit protected descendant is kept atomic
+        # (whole unit kept / omitted), whereas a two-sided addition still
+        # merges field by field.
         if self._protected_below(protected, path) and _revisions_as_dicts(
             base, left, right
         ):
+            if (left is MISSING) != (right is MISSING):
+                return self._guarded_structural_unit(
+                    path, base, left, right, conflicts, resolutions, protected
+                )
             return self._merge_object(
                 left, right, base, path, conflicts, resolutions, protected
             )
@@ -424,6 +439,138 @@ class Merger:
         """Whether *path* itself or any path beneath it is protected."""
         return any(p == path or p[: len(path)] == path for p in protected)
 
+    def _has_protected_descendant(
+        self, protected: frozenset[tuple], path: tuple
+    ) -> bool:
+        """Whether a strictly deeper path than *path* is protected."""
+        return any(
+            len(p) > len(path) and p[: len(path)] == path for p in protected
+        )
+
+    def _guarded_structural_unit(
+        self,
+        path: tuple,
+        base: Any,
+        left: Any,
+        right: Any,
+        conflicts: list[RawConflict],
+        resolutions: dict[tuple, str],
+        protected: frozenset[tuple],
+    ) -> Any:
+        """Atomically keep/adjudicate a one-sided added/deleted structure.
+
+        The unit -- an object or an identity-array item -- is added or
+        deleted on exactly one side and contains a hit protected
+        descendant. Such a unit is never assembled field by field:
+
+        * every hit protected descendant reports ``protected_change`` with
+          its original three-way values;
+        * without an adjudication the whole base block is kept, and a unit
+          absent from base is not written at all (``MISSING``);
+        * an explicit resolution for any reported descendant places the
+          chosen side's whole unit (the absent side omits it). When several
+          descendants are adjudicated differently the lowest internal path
+          decides, keeping the outcome deterministic.
+        """
+        descendants: list[tuple] = []
+        self._emit_protected_descendants(
+            base, left, right, path, conflicts, protected, descendants
+        )
+        descendants.sort(key=_structural_path_key)
+        for sub in descendants:
+            side = resolutions.get(sub)
+            if side == "left":
+                return left
+            if side == "right":
+                return right
+            if side == "base":
+                return base
+        return base if base is not MISSING else MISSING
+
+    def _emit_protected_descendants(
+        self,
+        base: Any,
+        left: Any,
+        right: Any,
+        path: tuple,
+        conflicts: list[RawConflict],
+        protected: frozenset[tuple],
+        out: list[tuple],
+    ) -> None:
+        """Record ``protected_change`` at every hit path beneath *path*.
+
+        The traversal mirrors :meth:`_enumerate_changes` -- object keys and
+        identity-array items (plain arrays never diff) -- which is how the
+        protected set is keyed. A hit freezes its subtree, exactly as the
+        ordinary merge stops there.
+        """
+        values = (base, left, right)
+        if any(isinstance(v, dict) for v in values):
+            # A present side that is not an object cannot carry traversable
+            # descendants; such paths never enter the protected set.
+            if not all(v is MISSING or isinstance(v, dict) for v in values):
+                return
+            objs = tuple(v if isinstance(v, dict) else {} for v in values)
+            for key in set(objs[0]) | set(objs[1]) | set(objs[2]):
+                sub = path + (key,)
+                sub_values = tuple(o.get(key, MISSING) for o in objs)
+                if sub in protected:
+                    conflicts.append(
+                        RawConflict("protected_change", sub, *sub_values)
+                    )
+                    out.append(sub)
+                elif self._has_protected_descendant(protected, sub):
+                    self._emit_protected_descendants(
+                        *sub_values, sub, conflicts, protected, out
+                    )
+            return
+
+        if any(isinstance(v, list) for v in values):
+            if not all(v is MISSING or isinstance(v, list) for v in values):
+                return
+            id_key = self._identity_key(path)
+            lists = [v if isinstance(v, list) else [] for v in values]
+            base_list, left_list, right_list = lists
+            if id_key is None or not _identity_eligible(
+                base_list, left_list, right_list, id_key
+            ):
+                return
+            base_map = _index_items(base_list, id_key)
+            left_map = _index_items(left_list, id_key)
+            right_map = _index_items(right_list, id_key)
+            ordered_ids: list[tuple[Any, str]] = [
+                (item[id_key], canon) for canon, item in base_map.items()
+            ]
+            new_ids = (set(left_map) | set(right_map)) - set(base_map)
+            ordered_ids.extend(
+                (
+                    (left_map[c] if c in left_map else right_map[c])[id_key],
+                    c,
+                )
+                for c in sorted(
+                    new_ids,
+                    key=lambda c: _sort_key(
+                        (left_map[c] if c in left_map else right_map[c])[id_key]
+                    ),
+                )
+            )
+            for id_value, canon in ordered_ids:
+                sub = path + (IdMarker(id_key, id_value),)
+                sub_values = (
+                    base_map.get(canon, MISSING),
+                    left_map.get(canon, MISSING),
+                    right_map.get(canon, MISSING),
+                )
+                if sub in protected:
+                    conflicts.append(
+                        RawConflict("protected_change", sub, *sub_values)
+                    )
+                    out.append(sub)
+                elif self._has_protected_descendant(protected, sub):
+                    self._emit_protected_descendants(
+                        *sub_values, sub, conflicts, protected, out
+                    )
+
     # ----------------------------------------------------- change scanning
 
     def _enumerate_changes(
@@ -462,17 +609,22 @@ class Merger:
             return changed
 
         if (
-            isinstance(base, list)
+            (base is MISSING or isinstance(base, list))
             and (left is MISSING or isinstance(left, list))
             and (right is MISSING or isinstance(right, list))
-            and (left is not MISSING or right is not MISSING)
+            and (
+                isinstance(base, list)
+                or left is not MISSING
+                or right is not MISSING
+            )
             and (id_key := self._identity_key(path)) is not None
         ):
+            base_list = base if isinstance(base, list) else []
             left_list = left if isinstance(left, list) else []
             right_list = right if isinstance(right, list) else []
-            if _identity_eligible(base, left_list, right_list, id_key):
+            if _identity_eligible(base_list, left_list, right_list, id_key):
                 changed |= self._enumerate_identity_changes(
-                    base, left_list, right_list, path, id_key
+                    base_list, left_list, right_list, path, id_key
                 )
         return changed
 
@@ -497,14 +649,23 @@ class Merger:
             if json_equal(left_item, base_item) and json_equal(right_item, base_item):
                 continue
             changed.add(item_path)
-            if left_item is not MISSING and right_item is not MISSING:
-                # Fields merge individually while both revisions carry the
-                # item, including one-sided untouched-but-present edits.
-                for key in set(base_item) | set(left_item) | set(right_item):
+            if left_item is not MISSING or right_item is not MISSING:
+                # Fields merge individually while at least one revision
+                # carries the item (edits, one-sided deletions). A
+                # both-side deletion is matched only by the item's original
+                # path itself.
+                field_obj = (
+                    left_item if left_item is not MISSING else right_item
+                )
+                for key in set(base_item) | set(
+                    field_obj if isinstance(field_obj, dict) else ()
+                ):
                     changed |= self._enumerate_changes(
                         base_item.get(key, MISSING),
-                        left_item.get(key, MISSING),
-                        right_item.get(key, MISSING),
+                        left_item.get(key, MISSING)
+                        if left_item is not MISSING else MISSING,
+                        right_item.get(key, MISSING)
+                        if right_item is not MISSING else MISSING,
                         item_path + (key,),
                     )
 
@@ -568,6 +729,16 @@ class Merger:
                     if guarded is not MISSING:
                         result.append(guarded)
                     continue
+                # A hit protected field under a one-sided item deletion
+                # freezes the whole item: never a field-wise reconstruction.
+                if self._has_protected_descendant(protected, item_path):
+                    chosen = self._guarded_structural_unit(
+                        item_path, base_item, MISSING, right_item,
+                        conflicts, resolutions, protected,
+                    )
+                    if chosen is not MISSING:
+                        result.append(chosen)
+                    continue
                 if json_equal(right_item, base_item):
                     continue  # right untouched: accept the deletion
                 # Deleted on the left, modified on the right: keep base.
@@ -595,6 +766,16 @@ class Merger:
                 if guarded is not _UNGUARDED:
                     if guarded is not MISSING:
                         result.append(guarded)
+                    continue
+                # A hit protected field under a one-sided item deletion
+                # freezes the whole item: never a field-wise reconstruction.
+                if self._has_protected_descendant(protected, item_path):
+                    chosen = self._guarded_structural_unit(
+                        item_path, base_item, left_item, MISSING,
+                        conflicts, resolutions, protected,
+                    )
+                    if chosen is not MISSING:
+                        result.append(chosen)
                     continue
                 if json_equal(left_item, base_item):
                     continue  # left untouched: accept the deletion
@@ -652,8 +833,10 @@ class Merger:
             item_path = path + (marker,)
 
             # An item-level protected path freezes the whole addition; a
-            # protected field below it switches the item to field-wise
-            # merging so only the protected fields are withheld.
+            # protected field below a one-sided addition makes the whole
+            # new item atomic (it is never partially appended). A divergent
+            # two-sided addition still merges field-wise so only the
+            # protected field is withheld.
             protected_below = item_path in protected or any(
                 p[: len(item_path)] == item_path for p in protected
             )
@@ -668,6 +851,14 @@ class Merger:
                     chosen = _resolve_outcome(
                         item_path, resolutions,
                         MISSING, MISSING, left_item, right_item,
+                    )
+                    if chosen is not MISSING:
+                        new_items.append((chosen[id_key], chosen))
+                    continue
+                if (left_item is MISSING) != (right_item is MISSING):
+                    chosen = self._guarded_structural_unit(
+                        item_path, MISSING, left_item, right_item,
+                        conflicts, resolutions, protected,
                     )
                     if chosen is not MISSING:
                         new_items.append((chosen[id_key], chosen))
@@ -932,6 +1123,22 @@ def _sort_key(value: Any):
         return (3, value)
     # Composite (array/object) identity: fall back to canonical JSON text.
     return (4, _canonical_id(value))
+
+
+def _structural_path_key(path: tuple):
+    """Total ordering over internal paths (object keys / IdMarkers).
+
+    Used to pick deterministically which adjudicated descendant governs a
+    guarded structural unit when several are resolved differently.
+    """
+    key = []
+    for step in path:
+        if isinstance(step, IdMarker):
+            # Markers (identity-array items) sort after object keys.
+            key.append((1, step.id_key, _sort_key(step.id_value)))
+        else:
+            key.append((0, str(step)))
+    return key
 
 
 def _public(value: Any) -> Any:

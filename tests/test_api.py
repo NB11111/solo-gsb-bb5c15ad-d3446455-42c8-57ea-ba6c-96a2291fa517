@@ -420,6 +420,64 @@ def test_unresolved_protected_conflict_keeps_base_with_other_resolution():
     assert {c["pointer"] for c in body["conflicts"]} == {"/a", "/b"}
 
 
+def test_protected_paths_one_sided_object_addition_is_atomic():
+    # A one-sided object addition containing a hit protected descendant is
+    # withheld whole; adjudicating the reported descendant writes the
+    # chosen side's whole object.
+    payload = {
+        "base": {},
+        "left": {"o": {"x": 1, "y": 2}},
+        "right": {},
+        "protectedPaths": ["/o/x"],
+    }
+    response = client.post("/merge", json=payload)
+    assert response.status_code == 200
+    body = response.json()
+    assert body["merged"] == {}
+    assert body["conflicts"] == [
+        {"pointer": "/o/x", "kind": "protected_change",
+         "base": None, "left": 1, "right": None}
+    ]
+
+    payload["conflictResolutions"] = [
+        {"pointer": "/o/x", "resolution": "left"}
+    ]
+    response = client.post("/merge", json=payload)
+    assert response.status_code == 200
+    body = response.json()
+    assert body["merged"] == {"o": {"x": 1, "y": 2}}
+    assert body["conflicts"][0]["pointer"] == "/o/x"
+
+
+def test_protected_paths_one_sided_identity_item_deletion_is_atomic():
+    payload = {
+        "base": {"s": [{"id": "a", "v": 1, "w": 1}, {"id": "b"}]},
+        "left": {"s": [{"id": "b"}]},  # deletes item a
+        "right": {"s": [{"id": "a", "v": 1, "w": 1}, {"id": "b"}]},
+        "arrayIdentity": {"/s": "id"},
+        "protectedPaths": ["/s/0/v"],
+    }
+    response = client.post("/merge", json=payload)
+    assert response.status_code == 200
+    body = response.json()
+    # The whole deleted item is kept, not a field-wise reconstruction.
+    assert body["merged"] == {
+        "s": [{"id": "a", "v": 1, "w": 1}, {"id": "b"}]
+    }
+    assert body["conflicts"] == [
+        {"pointer": "/s/0/v", "kind": "protected_change",
+         "base": 1, "left": None, "right": 1}
+    ]
+
+    payload["conflictResolutions"] = [
+        {"pointer": "/s/0/v", "resolution": "left"}
+    ]
+    response = client.post("/merge", json=payload)
+    assert response.status_code == 200
+    body = response.json()
+    assert body["merged"] == {"s": [{"id": "b"}]}
+
+
 def test_invalid_protected_pointer_returns_400():
     response = client.post(
         "/merge",

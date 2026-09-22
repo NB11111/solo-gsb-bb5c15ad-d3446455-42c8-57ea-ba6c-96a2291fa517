@@ -76,11 +76,16 @@ class MergeRequest(BaseModel):
             "the base value is kept and a conflict with kind "
             "'protected_change' carrying the three-way values is reported. "
             "Fields of objects and identity-array items match their final "
-            "reported pointer; deletions match their original path. An "
-            "explicit conflictResolutions entry for the reported pointer "
-            "overrides the protection; unresolved protected conflicts keep "
-            "the base value. Malformed or duplicate pointers are rejected "
-            "with HTTP 400."
+            "reported pointer; deletions match their original path. When an "
+            "object or identity-array item is added or deleted on one side "
+            "and contains a hit protected descendant, that structural unit "
+            "is kept atomic: it is never assembled field by field, so "
+            "unresolved the whole base block is kept (or nothing is written "
+            "when base lacks the unit), while every hit descendant is still "
+            "reported. An explicit conflictResolutions entry for any "
+            "reported descendant places the chosen side's whole unit; "
+            "unresolved protected conflicts keep the base value. Malformed "
+            "or duplicate pointers are rejected with HTTP 400."
         ),
     )
 
