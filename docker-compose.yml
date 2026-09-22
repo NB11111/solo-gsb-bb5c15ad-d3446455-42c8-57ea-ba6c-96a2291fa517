@@ -1,0 +1,21 @@
+services:
+  merge-api:
+    build: .
+    image: json-merge-api:latest
+    ports:
+      - "${PUBLISH_PORT:-8000}:8000"
+    environment:
+      # Maximum accepted request body. Plain bytes, or suffix K/M/G
+      # (1024-based), e.g. 1048576, 256K, 10M. 0 disables the limit.
+      MAX_REQUEST_SIZE_BYTES: "${MAX_REQUEST_SIZE_BYTES:-10M}"
+    restart: unless-stopped
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - "import json,urllib.request,sys; sys.exit(0 if json.load(urllib.request.urlopen('http://127.0.0.1:8000/health', timeout=3)).get('status') == 'ok' else 1)"
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 5s
