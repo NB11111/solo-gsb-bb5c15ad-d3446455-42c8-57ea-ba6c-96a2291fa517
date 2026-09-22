@@ -635,20 +635,74 @@ def test_protected_object_blocks_one_sided_deletion_of_subtree():
     assert conflicts == [("/o", "protected_change", {"x": 1}, None, {"x": 1})]
 
 
-def test_protected_field_under_one_sided_object_addition_is_withheld():
+def test_protected_field_under_one_sided_object_addition_blocks_whole_block():
+    # A one-sided object addition is one atomic structural unit: a hit
+    # protected descendant keeps the whole block out of merged (base has no
+    # such object); it is never assembled field by field.
     merged, conflicts = merge_protected(
         {}, {"o": {"x": 1, "y": 2}}, {}, ["/o/x"]
     )
-    assert merged == {"o": {"y": 2}}
+    assert merged == {}
     assert conflicts == [("/o/x", "protected_change", None, 1, None)]
 
 
-def test_protected_field_under_one_sided_object_deletion_is_kept():
+def test_protected_field_under_one_sided_object_addition_resolution_writes_block():
+    merged, conflicts = merge_protected(
+        {}, {"o": {"x": 1, "y": 2}}, {}, ["/o/x"],
+        resolutions={"/o/x": "left"},
+    )
+    # The explicit adjudication writes the whole added block.
+    assert merged == {"o": {"x": 1, "y": 2}}
+    assert conflicts == [("/o/x", "protected_change", None, 1, None)]
+
+    # "base" adjudicates to absence just like the unresolved default.
+    merged, _ = merge_protected(
+        {}, {"o": {"x": 1, "y": 2}}, {}, ["/o/x"],
+        resolutions={"/o/x": "base"},
+    )
+    assert merged == {}
+
+
+def test_protected_field_under_one_sided_object_deletion_keeps_whole_block():
+    # A one-sided object deletion carrying a hit protected descendant keeps
+    # the base block wholesale, including its unprotected sibling field.
     merged, conflicts = merge_protected(
         {"o": {"x": 1, "y": 1}}, {}, {"o": {"x": 1, "y": 1}}, ["/o/x"]
     )
-    assert merged == {"o": {"x": 1}}
+    assert merged == {"o": {"x": 1, "y": 1}}
     assert conflicts == [("/o/x", "protected_change", 1, None, 1)]
+
+    # Adjudicating to the deleting side removes the whole block.
+    merged, _ = merge_protected(
+        {"o": {"x": 1, "y": 1}}, {}, {"o": {"x": 1, "y": 1}}, ["/o/x"],
+        resolutions={"/o/x": "left"},
+    )
+    assert merged == {}
+
+    # The surviving side editing another field still does not split the
+    # unit: the whole base block stays until adjudicated.
+    merged, conflicts = merge_protected(
+        {"o": {"x": 1, "y": 1}}, {}, {"o": {"x": 1, "y": 8}}, ["/o/x"]
+    )
+    assert merged == {"o": {"x": 1, "y": 1}}
+    assert conflicts == [("/o/x", "protected_change", 1, None, 1)]
+
+    # ... and adjudicating to the surviving side keeps its whole object.
+    merged, _ = merge_protected(
+        {"o": {"x": 1, "y": 1}}, {}, {"o": {"x": 1, "y": 8}}, ["/o/x"],
+        resolutions={"/o/x": "right"},
+    )
+    assert merged == {"o": {"x": 1, "y": 8}}
+
+
+def test_protected_field_under_one_sided_addition_without_hit_still_merges():
+    # The block is one-sided-added but the configured descendant never
+    # changes: the atomic shortcut applies, so the addition is accepted.
+    merged, conflicts = merge_protected(
+        {}, {"o": {"y": 2}}, {}, ["/o/x"]
+    )
+    assert merged == {"o": {"y": 2}}
+    assert conflicts == []
 
 
 def test_protected_root_protects_the_whole_document():
@@ -756,16 +810,75 @@ def test_protected_new_identity_item_is_not_appended():
     ]
 
 
-def test_protected_field_of_new_identity_item_withholds_only_field():
+def test_protected_field_of_new_identity_item_blocks_whole_item():
     base = {"s": []}
     left = {"s": [{"id": "n", "v": 1, "w": 2}]}
     right = {"s": []}
     merged, conflicts = merge_protected(
         base, left, right, ["/s/0/v"], {"/s": "id"}
     )
-    # The item is still appended; only the protected field is withheld.
-    assert merged == {"s": [{"id": "n", "w": 2}]}
+    # One-sided addition carrying a hit protected descendant: the whole
+    # item is withheld (base has no such item), never field-assembled.
+    assert merged == {"s": []}
     assert conflicts == [("/s/0/v", "protected_change", None, 1, None)]
+
+    # An explicit resolution appends the chosen side's whole item.
+    merged, _ = merge_protected(
+        base, left, right, ["/s/0/v"], {"/s": "id"},
+        resolutions={"/s/0/v": "left"},
+    )
+    assert merged == {"s": [{"id": "n", "v": 1, "w": 2}]}
+
+
+def test_protected_field_of_one_sided_deleted_identity_item_keeps_whole_item():
+    # Left deletes the item outright; right leaves it. A protected field
+    # descendant is hit by the removal: the whole base item is kept.
+    base = {"s": [{"id": "a", "v": 1, "w": 2}]}
+    left = {"s": []}
+    right = base
+    merged, conflicts = merge_protected(
+        base, left, right, ["/s/0/v"], {"/s": "id"}
+    )
+    assert merged == base
+    assert conflicts == [
+        ("/s/0/v", "protected_change", 1, None, 1)
+    ]
+
+    # Adjudicating to the deleting side removes the whole item.
+    merged, _ = merge_protected(
+        base, left, right, ["/s/0/v"], {"/s": "id"},
+        resolutions={"/s/0/v": "left"},
+    )
+    assert merged == {"s": []}
+
+    # The surviving side may even edit the protected field: still one
+    # atomic delete-vs-change unit, kept wholesale until adjudicated.
+    right_edited = {"s": [{"id": "a", "v": 9, "w": 2}]}
+    merged, conflicts = merge_protected(
+        base, left, right_edited, ["/s/0/v"], {"/s": "id"}
+    )
+    assert merged == base
+    assert conflicts == [
+        ("/s/0/v", "protected_change", 1, None, 9)
+    ]
+    merged, _ = merge_protected(
+        base, left, right_edited, ["/s/0/v"], {"/s": "id"},
+        resolutions={"/s/0/v": "right"},
+    )
+    assert merged == {"s": [{"id": "a", "v": 9, "w": 2}]}
+
+
+def test_protected_field_of_one_sided_deleted_item_uses_original_pointer():
+    # The item leaves the array on the deleting side; its other item shifts
+    # forward. The hit is reported at the item's original base index.
+    base = {"s": [{"id": "a", "v": 1}, {"id": "b", "v": 2}]}
+    left = {"s": [{"id": "b", "v": 2}]}  # deletes a
+    right = base
+    merged, conflicts = merge_protected(
+        base, left, right, ["/s/0/v"], {"/s": "id"}
+    )
+    assert merged == base
+    assert conflicts == [("/s/0/v", "protected_change", 1, None, 1)]
 
 
 def test_protected_field_of_divergent_new_identity_item():

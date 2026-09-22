@@ -18,8 +18,14 @@ one-sided or identical change -- is never written automatically. The base
 value is kept and a ``protected_change`` conflict carrying the three-way
 values is reported instead. Fields of objects and of identity-array items
 match by their final reported pointer; deletions match by the original path.
-As with other conflicts, an explicit resolution overrides the protection;
-unresolved protected conflicts keep the base value.
+When a one-sided add/delete of an object, or a one-sided
+addition/removal of an identity-array item, carries a hit protected
+descendant, that whole structural unit is atomic -- it is never assembled
+field by field. Unresolved, the unit stays exactly as in base (the whole
+block kept, or wholly absent from ``merged`` when base carried it nowhere);
+an explicit resolution for any hit protected path writes the chosen side's
+whole unit. As with other conflicts, an explicit resolution overrides the
+protection; unresolved protected conflicts keep the base value.
 
 Object arrays listed in the identity mapping are merged per item keyed by an
 identity field. Arrays without an identity field are treated as atomic
@@ -307,19 +313,35 @@ class Merger:
 
         # Structured values recurse first so independent nested edits are
         # accepted individually and only truly conflicting leaves are
-        # reported. This must precede the one-sided shortcuts: a protected
-        # field underneath a one-sided add/delete must still be visited.
+        # reported.
         if isinstance(base, dict) and isinstance(left, dict) and isinstance(right, dict):
             return self._merge_object(
                 left, right, base, path, conflicts, resolutions, protected
             )
-        # One-sided add/delete of an object (or two-sided object addition):
-        # normally atomic, but descend when a protected path lives below.
-        if self._protected_below(protected, path) and _revisions_as_dicts(
-            base, left, right
+        # An object added on both sides where base carried none is normally
+        # atomic, but descends field by field when a protected path lives
+        # below (identical fields merge once; divergent or protected fields
+        # are reported at their own pointers).
+        if (
+            base is MISSING
+            and isinstance(left, dict)
+            and isinstance(right, dict)
+            and self._protected_below(protected, path)
         ):
             return self._merge_object(
                 left, right, base, path, conflicts, resolutions, protected
+            )
+        # A one-sided object add/delete is one atomic structural unit. When
+        # it carries a hit protected descendant it must never be assembled
+        # field by field: unresolved it stays exactly as in base (the whole
+        # block kept, or wholly absent when base had none); an explicit
+        # resolution for a hit protected path writes the chosen side's whole
+        # unit. Without a hit it follows the ordinary atomic shortcut.
+        if (left is MISSING or right is MISSING) and _revisions_as_dicts(
+            base, left, right
+        ):
+            return self._merge_one_sided_object(
+                base, left, right, path, conflicts, resolutions, protected
             )
 
         if (
@@ -333,23 +355,39 @@ class Merger:
                 base, left, right, path, id_key,
                 conflicts, resolutions, protected,
             )
-        # One-sided delete/add of an identity array: otherwise atomic, but
-        # descend so protected item paths (deletions by original path) are
-        # enforced.
-        if self._protected_below(protected, path) and isinstance(base, list):
-            left_list = left if isinstance(left, list) else []
-            right_list = right if isinstance(right, list) else []
-            if (
-                (left is MISSING or isinstance(left, list))
-                and (right is MISSING or isinstance(right, list))
-                and (left is not MISSING or right is not MISSING)
-                and (id_key := self._identity_key(path)) is not None
-                and _identity_eligible(base, left_list, right_list, id_key)
-            ):
-                return self._merge_identity_array(
-                    base, left_list, right_list, path, id_key,
-                    conflicts, resolutions, protected,
+        # One-sided delete/add of an identity array, or a one-sided array
+        # addition at an identity-configured path where base carried none:
+        # otherwise atomic, but merged per item when protection can reach
+        # inside -- deletions match by original path, and one-sided
+        # added/removed items carrying hit protected descendants are
+        # enforced as atomic units.
+        base_list = base if isinstance(base, list) else (
+            [] if base is MISSING else None
+        )
+        left_list = left if isinstance(left, list) else ([] if left is MISSING else None)
+        right_list = right if isinstance(right, list) else (
+            [] if right is MISSING else None
+        )
+        if (
+            base_list is not None
+            and left_list is not None
+            and right_list is not None
+            and (left is not MISSING or right is not MISSING)
+            and (
+                (base is not MISSING and self._protected_below(protected, path))
+                or (
+                    base is MISSING
+                    and (left is MISSING or right is MISSING)
+                    and self._protected_pattern_under(path)
                 )
+            )
+            and (id_key := self._identity_key(path)) is not None
+            and _identity_eligible(base_list, left_list, right_list, id_key)
+        ):
+            return self._merge_identity_array(
+                base_list, left_list, right_list, path, id_key,
+                conflicts, resolutions, protected,
+            )
 
         # One side absent, the other present (scalar / non-identity array).
         if left is MISSING:
@@ -412,17 +450,95 @@ class Merger:
             )
             if merged is not MISSING:
                 result[key] = merged
-        # A whole-object delete/add shortcut (only reachable for protected
-        # descendants) keeps MISSING distinct from an empty object.
-        if not result and (left is MISSING or right is MISSING) and not (
-            set(left_obj) | set(right_obj)
-        ):
-            return MISSING
         return result
 
     def _protected_below(self, protected: frozenset[tuple], path: tuple) -> bool:
         """Whether *path* itself or any path beneath it is protected."""
         return any(p == path or p[: len(path)] == path for p in protected)
+
+    def _protected_pattern_under(self, path: tuple) -> bool:
+        """Whether a configured protected pattern can match *path* or a
+        descendant of it (a concrete identity-array item step renders as
+        ``"*"``)."""
+        prefix = tuple(
+            "*" if isinstance(step, IdMarker) else str(step) for step in path
+        )
+
+        def hit(tokens: tuple[str, ...]) -> bool:
+            return tokens == prefix or tokens[: len(prefix)] == prefix
+
+        return any(hit(t) for t in self._protected_exact) or any(
+            hit(t) for t in self._protected_wild
+        )
+
+    def _merge_one_sided_object(
+        self,
+        base: Any,
+        left: Any,
+        right: Any,
+        path: tuple,
+        conflicts: list[RawConflict],
+        resolutions: dict[tuple, str],
+        protected: frozenset[tuple],
+    ) -> Any:
+        """Merge an object added or removed on only one side.
+
+        This is one atomic structural unit: if a hit protected descendant
+        lives inside it, the unit is never assembled field by field. Every
+        hit protected path is reported (``protected_change``, missing sides
+        as ``null``); the unit is kept wholesale as base when unresolved, or
+        written wholesale from the chosen side when any hit carries an
+        explicit resolution (the first hit in pointer order decides).
+        Without a protected hit the ordinary atomic shortcut applies.
+        """
+        present = left if left is not MISSING else right
+        hits = sorted(
+            (p for p in protected if p == path or p[: len(path)] == path),
+            key=_path_sort_key,
+        )
+        if hits:
+            for hit_path in hits:
+                b, l, r = _descend_at(base, left, right, hit_path[len(path):])
+                conflicts.append(
+                    RawConflict("protected_change", hit_path, b, l, r)
+                )
+            side = self._hit_resolution(hits, resolutions)
+            if side == "left":
+                return left
+            if side == "right":
+                return right
+            # "base" or unresolved: the unit stays exactly as in base --
+            # the whole block kept, or wholly absent when base had none.
+            return base
+        if base is MISSING:
+            return present  # added on one side only
+        # Deleted on one side; accept the deletion while the surviving side
+        # leaves the object untouched, otherwise keep base and report the
+        # unit-level delete-versus-modify conflict.
+        survivor = left if left is not MISSING else right
+        if json_equal(survivor, base):
+            return MISSING
+        conflicts.append(
+            RawConflict("delete_vs_modify", path, base, left, right)
+        )
+        return _resolve_outcome(
+            path, resolutions, base, base, left, right
+        )
+
+    @staticmethod
+    def _hit_resolution(
+        hits: list[tuple], resolutions: dict[tuple, str]
+    ) -> Optional[str]:
+        """Explicit resolution governing an atomic unit with protected hits.
+
+        Hit paths are visited in pointer order; the first adjudicated one
+        decides the whole unit.
+        """
+        for hit_path in sorted(hits, key=_path_sort_key):
+            side = resolutions.get(hit_path)
+            if side is not None:
+                return side
+        return None
 
     # ----------------------------------------------------- change scanning
 
@@ -462,17 +578,28 @@ class Merger:
             return changed
 
         if (
-            isinstance(base, list)
+            (base is MISSING or isinstance(base, list))
             and (left is MISSING or isinstance(left, list))
             and (right is MISSING or isinstance(right, list))
             and (left is not MISSING or right is not MISSING)
             and (id_key := self._identity_key(path)) is not None
+            and (
+                # Existing arrays are always enumerated; an array added on
+                # one side only needs enumeration when a protected pattern
+                # could reach an item below it.
+                base is not MISSING
+                or (
+                    (left is MISSING or right is MISSING)
+                    and self._protected_pattern_under(path)
+                )
+            )
         ):
+            base_list = base if isinstance(base, list) else []
             left_list = left if isinstance(left, list) else []
             right_list = right if isinstance(right, list) else []
-            if _identity_eligible(base, left_list, right_list, id_key):
+            if _identity_eligible(base_list, left_list, right_list, id_key):
                 changed |= self._enumerate_identity_changes(
-                    base, left_list, right_list, path, id_key
+                    base_list, left_list, right_list, path, id_key
                 )
         return changed
 
@@ -497,6 +624,10 @@ class Merger:
             if json_equal(left_item, base_item) and json_equal(right_item, base_item):
                 continue
             changed.add(item_path)
+            if left_item is MISSING and right_item is MISSING:
+                # Deleted on both sides: the whole item goes away; it is not
+                # part of one-sided structural changes.
+                continue
             if left_item is not MISSING and right_item is not MISSING:
                 # Fields merge individually while both revisions carry the
                 # item, including one-sided untouched-but-present edits.
@@ -505,6 +636,22 @@ class Merger:
                         base_item.get(key, MISSING),
                         left_item.get(key, MISSING),
                         right_item.get(key, MISSING),
+                        item_path + (key,),
+                    )
+            else:
+                # Removed on one side: enumerate the surviving side against
+                # base so a hit protected descendant of the deleted item is
+                # detected and the item treated as one atomic unit.
+                survivor = left_item if left_item is not MISSING else right_item
+                for key in set(base_item) | set(survivor):
+                    changed |= self._enumerate_changes(
+                        base_item.get(key, MISSING),
+                        (left_item if left_item is not MISSING else {}).get(
+                            key, MISSING
+                        ),
+                        (right_item if right_item is not MISSING else {}).get(
+                            key, MISSING
+                        ),
                         item_path + (key,),
                     )
 
@@ -560,7 +707,7 @@ class Merger:
                     result.append(base_item)
                 continue  # deleted on both sides
             if left_item is MISSING:
-                guarded = self._protected_item(
+                guarded = self._guarded_item_unit(
                     item_path, base_item, MISSING, right_item,
                     conflicts, resolutions, protected,
                 )
@@ -588,7 +735,7 @@ class Merger:
                     result.append(chosen)
                 continue
             if right_item is MISSING:
-                guarded = self._protected_item(
+                guarded = self._guarded_item_unit(
                     item_path, base_item, left_item, MISSING,
                     conflicts, resolutions, protected,
                 )
@@ -621,9 +768,10 @@ class Merger:
             # edits are accepted and protected/conflicting fields reported
             # individually. Field-wise merging of the shortcut cases
             # produces the same item the old whole-item rules chose.
-            guarded = self._protected_item(
+            guarded = self._guarded_item_unit(
                 item_path, base_item, left_item, right_item,
                 conflicts, resolutions, protected,
+                descendants_atomic=False,
             )
             if guarded is not _UNGUARDED:
                 if guarded is not MISSING:
@@ -651,27 +799,41 @@ class Merger:
             marker = IdMarker(id_key, present[id_key])
             item_path = path + (marker,)
 
-            # An item-level protected path freezes the whole addition; a
-            # protected field below it switches the item to field-wise
-            # merging so only the protected fields are withheld.
-            protected_below = item_path in protected or any(
-                p[: len(item_path)] == item_path for p in protected
-            )
-            if protected_below:
-                if item_path in protected:
-                    conflicts.append(
-                        RawConflict(
-                            "protected_change", item_path,
-                            MISSING, left_item, right_item,
-                        )
+            # An item-level protected path freezes the whole addition.
+            if item_path in protected:
+                conflicts.append(
+                    RawConflict(
+                        "protected_change", item_path,
+                        MISSING, left_item, right_item,
                     )
-                    chosen = _resolve_outcome(
-                        item_path, resolutions,
-                        MISSING, MISSING, left_item, right_item,
-                    )
-                    if chosen is not MISSING:
-                        new_items.append((chosen[id_key], chosen))
-                    continue
+                )
+                chosen = _resolve_outcome(
+                    item_path, resolutions,
+                    MISSING, MISSING, left_item, right_item,
+                )
+                if chosen is not MISSING:
+                    new_items.append((chosen[id_key], chosen))
+                continue
+            descendant_hits = [
+                p for p in protected if p[: len(item_path)] == item_path
+            ]
+            if descendant_hits and (left_item is MISSING or right_item is MISSING):
+                # One-sided addition carrying a hit protected descendant:
+                # the item is one atomic structural unit, never assembled
+                # field by field. Unresolved it is withheld wholesale; an
+                # explicit resolution for a hit protected path appends the
+                # chosen side's whole item.
+                guarded = self._guarded_item_unit(
+                    item_path, MISSING, left_item, right_item,
+                    conflicts, resolutions, protected,
+                )
+                if guarded is not _UNGUARDED and guarded is not MISSING:
+                    new_items.append((guarded[id_key], guarded))
+                continue
+            if descendant_hits:
+                # Both sides add the same new identity: independent fields
+                # merge while the protected/divergent fields are reported
+                # individually.
                 merged_item = self._merge_new_item_fields(
                     left_item, right_item, item_path, id_key,
                     conflicts, resolutions, protected,
@@ -705,7 +867,7 @@ class Merger:
         result.extend(item for _, item in new_items)
         return result
 
-    def _protected_item(
+    def _guarded_item_unit(
         self,
         item_path: tuple,
         base_item: Any,
@@ -714,22 +876,50 @@ class Merger:
         conflicts: list[RawConflict],
         resolutions: dict[tuple, str],
         protected: frozenset[tuple],
+        descendants_atomic: bool = True,
     ) -> Any:
-        """Apply item-level protection for an identified base item.
+        """Apply protection to an identity-array item as one atomic unit.
 
-        Returns the value to keep (``MISSING`` deletes it), or
-        ``_UNGUARDED`` when the item path is unprotected or unchanged.
+        A hit at the item itself always protects the whole item. A hit at a
+        descendant also makes the whole item atomic for one-sided
+        add/remove shortcuts (*descendants_atomic*); for an item present on
+        both sides only the item path itself freezes wholesale --
+        descendant hits merge field by field instead.
+
+        Every hit protected path is reported and the item is kept wholesale
+        as base (or withheld wholesale when base had no such item), unless
+        an explicit resolution for a hit protected path writes the chosen
+        side's whole item. Returns ``_UNGUARDED`` when no hit protected
+        path changed on either side.
         """
-        if item_path not in protected:
+        hits = [
+            p
+            for p in protected
+            if p == item_path
+            or (descendants_atomic and p[: len(item_path)] == item_path)
+        ]
+        if not hits:
             return _UNGUARDED
-        if json_equal(left_item, base_item) and json_equal(right_item, base_item):
+        changed = False
+        for hit_path in sorted(hits, key=_path_sort_key):
+            b, l, r = _descend_at(
+                base_item, left_item, right_item, hit_path[len(item_path):]
+            )
+            if not json_equal(l, b) or not json_equal(r, b):
+                conflicts.append(
+                    RawConflict("protected_change", hit_path, b, l, r)
+                )
+                changed = True
+        if not changed:
             return _UNGUARDED
-        conflicts.append(
-            RawConflict("protected_change", item_path, base_item, left_item, right_item)
-        )
-        return _resolve_outcome(
-            item_path, resolutions, base_item, base_item, left_item, right_item
-        )
+        side = self._hit_resolution(hits, resolutions)
+        if side == "left":
+            return left_item
+        if side == "right":
+            return right_item
+        # "base" or unresolved: keep the base item wholesale (or withhold a
+        # base-less addition wholesale).
+        return base_item
 
     def _merge_new_item_fields(
         self,
@@ -1016,6 +1206,42 @@ def _revisions_as_dicts(base: Any, left: Any, right: Any) -> bool:
     return (left is MISSING or isinstance(left, dict)) and (
         right is MISSING or isinstance(right, dict)
     ) and (left is not MISSING or right is not MISSING)
+
+
+def _descend_at(base: Any, left: Any, right: Any, rel: tuple) -> tuple:
+    """Three-way values beneath a structural unit at relative path *rel*.
+
+    Dicts are followed by key; identity markers locate their item inside a
+    nested identity array. A missing key/item or a non-matching node is
+    rendered as :data:`MISSING`. Used to report the three-way values of
+    protected descendants without field-wise merging their unit.
+    """
+
+    def follow(node: Any) -> Any:
+        for step in rel:
+            if isinstance(step, IdMarker):
+                idx = _find_identity_or_none(node, step)
+                node = node[idx] if idx is not None else MISSING
+            elif isinstance(node, dict):
+                node = node.get(step, MISSING)
+            else:
+                return MISSING
+        return node
+
+    return follow(base), follow(left), follow(right)
+
+
+def _path_sort_key(path: tuple):
+    """Total, deterministic ordering over internal paths.
+
+    Object keys are strings and identity markers carry JSON scalars; both
+    are rendered to comparable text (markers as ``"*"``), so a tuple of
+    mixed step types never raises during sorting.
+    """
+    return tuple(
+        ("*",) if isinstance(step, IdMarker) else ("k", str(step))
+        for step in path
+    )
 
 
 def _find_identity_or_none(items: Any, marker: IdMarker) -> Optional[int]:

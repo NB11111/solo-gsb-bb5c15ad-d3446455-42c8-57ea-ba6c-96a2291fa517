@@ -384,6 +384,63 @@ def test_protected_paths_identity_array_final_pointer_and_original_path():
     }]
 
 
+def test_protected_path_inside_one_sided_object_add_is_atomic():
+    # The whole one-sided object block stays out of merged when it carries
+    # a hit protected descendant; it is never assembled field by field.
+    payload = {
+        "base": {"k": 1},
+        "left": {"k": 1, "o": {"secret": "rotated", "host": "h"}},
+        "right": {"k": 1},
+        "protectedPaths": ["/o/secret"],
+    }
+    response = client.post("/merge", json=payload)
+    assert response.status_code == 200
+    body = response.json()
+    assert body["merged"] == {"k": 1}
+    assert body["conflicts"] == [
+        {"pointer": "/o/secret", "kind": "protected_change",
+         "base": None, "left": "rotated", "right": None}
+    ]
+
+    # An explicit resolution writes the whole block.
+    payload["conflictResolutions"] = [
+        {"pointer": "/o/secret", "resolution": "left"}
+    ]
+    response = client.post("/merge", json=payload)
+    assert response.status_code == 200
+    body = response.json()
+    assert body["merged"] == {"k": 1, "o": {"secret": "rotated", "host": "h"}}
+    # The reported conflict keeps the original three-way values.
+    assert body["conflicts"] == [
+        {"pointer": "/o/secret", "kind": "protected_change",
+         "base": None, "left": "rotated", "right": None}
+    ]
+
+
+def test_protected_field_inside_one_sided_deleted_identity_item_keeps_item():
+    payload = {
+        "base": {"servers": [{"id": "a", "port": 8080, "tag": "x"},
+                             {"id": "b", "port": 80}]},
+        "left": {"servers": [{"id": "b", "port": 80}]},  # deletes a
+        "right": {"servers": [{"id": "a", "port": 8080, "tag": "x"},
+                              {"id": "b", "port": 80}]},
+        "arrayIdentity": {"/servers": "id"},
+        "protectedPaths": ["/servers/0/port"],
+    }
+    response = client.post("/merge", json=payload)
+    assert response.status_code == 200
+    body = response.json()
+    # The deleted item is kept wholesale (including its sibling field).
+    assert body["merged"] == payload["base"]
+    assert body["conflicts"] == [{
+        "pointer": "/servers/0/port",
+        "kind": "protected_change",
+        "base": 8080,
+        "left": None,
+        "right": 8080,
+    }]
+
+
 def test_conflict_resolution_overrides_protected_path():
     payload = {
         "base": {"a": 1},
